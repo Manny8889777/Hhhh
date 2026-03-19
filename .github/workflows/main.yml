@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Enable RDP
         run: |
+          Write-Host "Enabling RDP..."
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
@@ -25,28 +27,42 @@ jobs:
         run: |
           Write-Host "Setting up user..."
 
-          $password = "Rdp@123456!"   # FIXED PASSWORD (no confusion)
+          $username = "manny"
+          $password = "manny@123456!"
 
-          # Force create/reset user
-          net user RDP $password /add 2>$null
-          net user RDP $password
+          # Create or reset user
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              Write-Host "Creating user..."
+              net user $username $password /add
+          } else {
+              Write-Host "Resetting password..."
+              net user $username $password
+          }
 
-          net localgroup Administrators RDP /add
-          net localgroup "Remote Desktop Users" RDP /add
+          # Add to groups safely
+          net localgroup Administrators $username /add
+          net localgroup "Remote Desktop Users" $username /add
 
-          # Disable password expiry
-          wmic USERACCOUNT WHERE "Name='RDP'" SET PasswordExpires=FALSE
+          # Disable password expiry (NO wmic)
+          Set-LocalUser -Name $username -PasswordNeverExpires $true
 
-          echo "USERNAME=.\RDP" >> $env:GITHUB_ENV
+          echo "USERNAME=.\$username" >> $env:GITHUB_ENV
           echo "PASSWORD=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
-          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
-          Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait
+          Write-Host "Installing Tailscale..."
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $file = "$env:TEMP\ts.msi"
+
+          Invoke-WebRequest $url -OutFile $file
+          Start-Process msiexec.exe -ArgumentList "/i `"$file`" /quiet /norestart" -Wait
 
       - name: Connect Tailscale
         run: |
+          Write-Host "Connecting to Tailscale..."
+
           $auth = "${{ secrets.TAILSCALE_AUTH_KEY }}"
 
           if (-not $auth -or $auth -notlike "tskey-*") {
@@ -59,8 +75,12 @@ jobs:
           for ($i=0; $i -lt 5; $i++) {
             & $exe up --authkey=$auth --hostname=gh-rdp-$env:GITHUB_RUN_ID
 
-            if ($LASTEXITCODE -eq 0) { break }
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Connected!"
+              break
+            }
 
+            Write-Host "Retrying..."
             Start-Sleep -Seconds 10
           }
 
@@ -68,11 +88,24 @@ jobs:
           $ip = & $exe ip -4
 
           if (-not $ip) {
-            Write-Error "No IP"
+            Write-Error "Failed to get IP"
             exit 1
           }
 
           echo "TS_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Verify RDP
+        run: |
+          Write-Host "Checking RDP..."
+
+          $result = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+            Write-Error "RDP not reachable"
+            exit 1
+          }
+
+          Write-Host "RDP OK!"
 
       - name: Show Details
         run: |
@@ -86,11 +119,14 @@ jobs:
 
       - name: Keep Alive
         run: |
+          Write-Host "Keeping session alive..."
+
           for ($i=0; $i -lt 70; $i++) {
             Write-Host "Running $(Get-Date)"
 
             $svc = Get-Service TermService
             if ($svc.Status -ne "Running") {
+              Write-Host "Restarting RDP Service..."
               Restart-Service TermService -Force
             }
 
