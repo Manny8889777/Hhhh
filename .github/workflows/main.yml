@@ -1,12 +1,12 @@
-name: RDP
+name: Stable RDP
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */5 * * *"
+    - cron: "0 */5 * * *"   # restart every 5 hours
 
 jobs:
-  secure-rdp:
+  rdp:
     runs-on: windows-latest
     timeout-minutes: 360
 
@@ -21,28 +21,20 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" -Value 1
 
-          # Remove old rule if exists
-          netsh advfirewall firewall delete rule name="RDP" 2>$null
-
-          # Add fresh rule
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
 
-          Restart-Service -Name TermService -Force
+          Restart-Service TermService -Force
 
-      - name: Create User
+      - name: Create RDP User
         run: |
-          Write-Host "Creating RDP user..."
+          Write-Host "Creating user..."
 
           $password = "Rdp@$(Get-Random)!"
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Check if user exists
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Write-Host "User already exists, resetting password..."
-            net user RDP $password
-          } else {
+          try {
             New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
-          }
+          } catch {}
 
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
@@ -60,28 +52,22 @@ jobs:
           Invoke-WebRequest $url -OutFile $file
           Start-Process msiexec.exe -ArgumentList "/i `"$file`" /quiet /norestart" -Wait
 
-      - name: Connect Tailscale
+      - name: Connect Tailscale (Retry Safe)
         run: |
           Write-Host "Connecting to Tailscale..."
 
           $auth = "${{ secrets.TAILSCALE_AUTH_KEY }}"
-
-          if (-not $auth) {
-            Write-Error "TAILSCALE_AUTH_KEY is missing!"
-            exit 1
-          }
-
           $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           for ($i=0; $i -lt 6; $i++) {
-            & $exe up --authkey=$auth --hostname=gh-rdp-$env:GITHUB_RUN_ID
+            & $exe up --authkey=$auth --hostname=gh-rdp-$env:GITHUB_RUN_ID --accept-routes
 
             if ($LASTEXITCODE -eq 0) {
-              Write-Host "Tailscale Connected!"
+              Write-Host "Connected!"
               break
             }
 
-            Write-Host "Retry $i..."
+            Write-Host "Retrying..."
             Start-Sleep -Seconds 10
           }
 
@@ -95,20 +81,20 @@ jobs:
 
           echo "TS_IP=$ip" >> $env:GITHUB_ENV
 
-      - name: Verify RDP
+      - name: Verify RDP Port
         run: |
-          Write-Host "Checking RDP connectivity..."
+          Write-Host "Checking RDP port..."
 
           $result = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
 
           if (-not $result.TcpTestSucceeded) {
-            Write-Error "RDP not reachable!"
+            Write-Error "RDP port not reachable"
             exit 1
           }
 
-          Write-Host "RDP is working!"
+          Write-Host "RDP is reachable!"
 
-      - name: Show Details
+      - name: Display Connection Info
         run: |
           Write-Host ""
           Write-Host "====== RDP READY ======"
@@ -118,14 +104,14 @@ jobs:
           Write-Host "======================="
           Write-Host ""
 
-      - name: Keep Alive
+      - name: Keep Alive (Stable Loop)
         run: |
           Write-Host "Keeping session alive..."
 
           for ($i=0; $i -lt 70; $i++) {
             Write-Host "[$(Get-Date)] Running..."
-
-            # Ensure RDP service is alive
+            
+            # Check if RDP service is still alive
             $svc = Get-Service TermService
             if ($svc.Status -ne "Running") {
               Write-Host "Restarting RDP Service..."
