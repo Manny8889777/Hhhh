@@ -1,5 +1,4 @@
-
- name: Stable RDP
+name: Stable RDP
 
 on:
 workflow_dispatch:
