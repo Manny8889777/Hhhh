@@ -3,7 +3,7 @@ name: Stable RDP
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */5 * * *"   # restart every 5 hours
+    - cron: "0 */5 * * *"
 
 jobs:
   rdp:
@@ -13,61 +13,54 @@ jobs:
     steps:
       - name: Enable RDP
         run: |
-          Write-Host "Enabling RDP..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0
-
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 1
-
+          netsh advfirewall firewall delete rule name="RDP" 2>$null
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service TermService -Force
 
-      - name: Create RDP User
+      - name: Create / Fix RDP User
         run: |
-          Write-Host "Creating user..."
+          Write-Host "Setting up user..."
 
-          $password = "Rdp@$(Get-Random)!"
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          $password = "Rdp@123456!"   # FIXED PASSWORD (no confusion)
 
-          try {
-            New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
-          } catch {}
+          # Force create/reset user
+          net user RDP $password /add 2>$null
+          net user RDP $password
 
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          net localgroup Administrators RDP /add
+          net localgroup "Remote Desktop Users" RDP /add
 
-          echo "USERNAME=RDP" >> $env:GITHUB_ENV
+          # Disable password expiry
+          wmic USERACCOUNT WHERE "Name='RDP'" SET PasswordExpires=FALSE
+
+          echo "USERNAME=.\RDP" >> $env:GITHUB_ENV
           echo "PASSWORD=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
-          Write-Host "Installing Tailscale..."
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
+          Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait
 
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $file = "$env:TEMP\ts.msi"
-
-          Invoke-WebRequest $url -OutFile $file
-          Start-Process msiexec.exe -ArgumentList "/i `"$file`" /quiet /norestart" -Wait
-
-      - name: Connect Tailscale (Retry Safe)
+      - name: Connect Tailscale
         run: |
-          Write-Host "Connecting to Tailscale..."
-
           $auth = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+
+          if (-not $auth -or $auth -notlike "tskey-*") {
+            Write-Error "Invalid Tailscale key!"
+            exit 1
+          }
+
           $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          for ($i=0; $i -lt 6; $i++) {
-            & $exe up --authkey=$auth --hostname=gh-rdp-$env:GITHUB_RUN_ID --accept-routes
+          for ($i=0; $i -lt 5; $i++) {
+            & $exe up --authkey=$auth --hostname=gh-rdp-$env:GITHUB_RUN_ID
 
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "Connected!"
-              break
-            }
+            if ($LASTEXITCODE -eq 0) { break }
 
-            Write-Host "Retrying..."
             Start-Sleep -Seconds 10
           }
 
@@ -75,26 +68,13 @@ jobs:
           $ip = & $exe ip -4
 
           if (-not $ip) {
-            Write-Error "Failed to get Tailscale IP"
+            Write-Error "No IP"
             exit 1
           }
 
           echo "TS_IP=$ip" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Port
-        run: |
-          Write-Host "Checking RDP port..."
-
-          $result = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
-
-          if (-not $result.TcpTestSucceeded) {
-            Write-Error "RDP port not reachable"
-            exit 1
-          }
-
-          Write-Host "RDP is reachable!"
-
-      - name: Display Connection Info
+      - name: Show Details
         run: |
           Write-Host ""
           Write-Host "====== RDP READY ======"
@@ -104,17 +84,13 @@ jobs:
           Write-Host "======================="
           Write-Host ""
 
-      - name: Keep Alive (Stable Loop)
+      - name: Keep Alive
         run: |
-          Write-Host "Keeping session alive..."
-
           for ($i=0; $i -lt 70; $i++) {
-            Write-Host "[$(Get-Date)] Running..."
-            
-            # Check if RDP service is still alive
+            Write-Host "Running $(Get-Date)"
+
             $svc = Get-Service TermService
             if ($svc.Status -ne "Running") {
-              Write-Host "Restarting RDP Service..."
               Restart-Service TermService -Force
             }
 
